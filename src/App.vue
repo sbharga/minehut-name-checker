@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   CACHE_KEY,
   MAX_CONCURRENCY,
@@ -16,12 +16,18 @@ import {
 
 type ResultFilter = 'all' | ResultStatus
 type RunState = 'idle' | 'running' | 'complete' | 'stopped'
+type ProcessingOrder = 'input' | 'shortest' | 'longest'
+type ResultSort = 'newest' | 'oldest' | 'name-asc' | 'name-desc' | 'shortest' | 'longest' | 'status'
+
+const PROCESSING_ORDER_KEY = 'minehut-name-checker:processing-order'
 
 const input = ref('')
 const baseUrl = import.meta.env.BASE_URL
-const results = ref<CheckResult[]>([])
+const results = ref<CheckResult[]>(Object.values(loadCache()))
 const activeNames = ref<string[]>([])
 const selectedFilter = ref<ResultFilter>('all')
+const processingOrder = ref<ProcessingOrder>(loadProcessingOrder())
+const resultSort = ref<ResultSort>('newest')
 const runState = ref<RunState>('idle')
 const queueActive = ref(false)
 const totalCheckable = ref(0)
@@ -73,11 +79,27 @@ const filters = computed(() => [
   { value: 'error' as const, label: 'Failed', count: counts.value.error },
 ])
 
-const filteredResults = computed(() =>
-  selectedFilter.value === 'all'
+const filteredResults = computed(() => {
+  const filtered = selectedFilter.value === 'all'
     ? results.value
-    : results.value.filter((result) => result.status === selectedFilter.value),
-)
+    : results.value.filter((result) => result.status === selectedFilter.value)
+
+  return [...filtered].sort((a, b) => {
+    if (resultSort.value === 'oldest') return a.checkedAt - b.checkedAt
+    if (resultSort.value === 'name-asc') return a.normalizedName.localeCompare(b.normalizedName)
+    if (resultSort.value === 'name-desc') return b.normalizedName.localeCompare(a.normalizedName)
+    if (resultSort.value === 'shortest') {
+      return a.displayName.length - b.displayName.length || a.normalizedName.localeCompare(b.normalizedName)
+    }
+    if (resultSort.value === 'longest') {
+      return b.displayName.length - a.displayName.length || a.normalizedName.localeCompare(b.normalizedName)
+    }
+    if (resultSort.value === 'status') {
+      return a.status.localeCompare(b.status) || a.normalizedName.localeCompare(b.normalizedName)
+    }
+    return b.checkedAt - a.checkedAt
+  })
+})
 
 const progressLabel = computed(() => {
   if (runState.value === 'stopped') return 'Check stopped'
@@ -98,6 +120,16 @@ function loadCache(): ResultCache {
   }
 }
 
+function loadProcessingOrder(): ProcessingOrder {
+  try {
+    const saved = localStorage.getItem(PROCESSING_ORDER_KEY)
+    if (saved === 'input' || saved === 'shortest' || saved === 'longest') return saved
+  } catch {
+    // Use the default if browser storage is unavailable.
+  }
+  return 'shortest'
+}
+
 function persistCache(): void {
   try {
     writeSessionCache(sessionStorage, sessionCache.value)
@@ -110,8 +142,7 @@ async function startCheck(): Promise<void> {
   if (queueActive.value || uniqueCount.value === 0) return
 
   const parsed = parseNames(input.value)
-  results.value = [...parsed.invalid]
-  selectedFilter.value = 'all'
+  for (const invalid of parsed.invalid) upsertResult(invalid)
   activeNames.value = []
   totalCheckable.value = parsed.valid.length
   completedCheckable.value = 0
@@ -120,11 +151,21 @@ async function startCheck(): Promise<void> {
   now.value = runStartedAt.value
   rateLimitUntil.value = 0
 
+  const orderedNames = [...parsed.valid].sort((a, b) => {
+    if (processingOrder.value === 'shortest') {
+      return a.displayName.length - b.displayName.length
+    }
+    if (processingOrder.value === 'longest') {
+      return b.displayName.length - a.displayName.length
+    }
+    return 0
+  })
+
   const uncached = []
-  for (const name of parsed.valid) {
+  for (const name of orderedNames) {
     const cached = sessionCache.value[name.normalizedName]
     if (cached) {
-      results.value.push({ ...cached, displayName: name.displayName, source: 'cache' })
+      upsertResult({ ...cached, displayName: name.displayName, source: 'cache' })
       completedCheckable.value += 1
     } else {
       uncached.push(name)
@@ -157,7 +198,7 @@ async function startCheck(): Promise<void> {
       activeNames.value = activeNames.value.filter(
         (activeName) => activeName.toLowerCase() !== result.normalizedName,
       )
-      results.value.push(result)
+      upsertResult(result)
       completedCheckable.value += 1
       networkCompleted.value += 1
 
@@ -206,6 +247,39 @@ function clearHistory(): void {
   } catch {
     // Storage may be unavailable in restrictive browser modes.
   }
+  clearResults()
+}
+
+function upsertResult(result: CheckResult): void {
+  const existingIndex = results.value.findIndex(
+    (existing) => existing.normalizedName === result.normalizedName,
+  )
+  if (existingIndex === -1) results.value.push(result)
+  else results.value.splice(existingIndex, 1, result)
+}
+
+function exportResults(): void {
+  const header = ['Name', 'Status', 'Reason', 'Source', 'Checked at']
+  const rows = results.value.map((result) => [
+    result.displayName,
+    result.status,
+    result.reason ?? '',
+    result.source,
+    new Date(result.checkedAt).toISOString(),
+  ])
+  const csv = [header, ...rows]
+    .map((row) => row.map(csvCell).join(','))
+    .join('\r\n')
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `minehut-name-results-${new Date().toISOString().slice(0, 10)}.csv`
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function csvCell(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`
 }
 
 function stopTimer(): void {
@@ -236,6 +310,14 @@ function statusDotClasses(status: ResultStatus): string {
   }[status]
 }
 
+watch(processingOrder, (value) => {
+  try {
+    localStorage.setItem(PROCESSING_ORDER_KEY, value)
+  } catch {
+    // The setting remains active for this page when storage is unavailable.
+  }
+})
+
 onBeforeUnmount(() => {
   controller?.abort()
   stopTimer()
@@ -252,9 +334,17 @@ onBeforeUnmount(() => {
 
         <div class="flex items-center gap-2">
           <button
+            v-if="results.length"
+            type="button"
+            class="px-2.5 py-1.5 text-xs font-medium text-slate-400 transition hover:text-slate-200"
+            @click="exportResults"
+          >
+            Export CSV
+          </button>
+          <button
             type="button"
             class="px-2.5 py-1.5 text-xs font-medium text-slate-400 transition hover:text-slate-200 disabled:cursor-default disabled:opacity-40"
-            :disabled="cacheCount === 0 || queueActive"
+            :disabled="(cacheCount === 0 && results.length === 0) || queueActive"
             @click="clearHistory"
           >
             Clear cache<span v-if="cacheCount" class="ml-1 tabular-nums">{{ cacheCount }}</span>
@@ -313,6 +403,20 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="mt-3 flex shrink-0 items-center justify-between gap-3">
+            <label for="processing-order" class="text-xs font-medium text-slate-400">Processing order</label>
+            <select
+              id="processing-order"
+              v-model="processingOrder"
+              :disabled="queueActive"
+              class="rounded-md border border-white/10 bg-[#111] px-2.5 py-1.5 text-xs text-slate-300 outline-none focus:border-[#00C8D3]/80 disabled:opacity-50"
+            >
+              <option value="shortest">Shortest first</option>
+              <option value="longest">Longest first</option>
+              <option value="input">Input order</option>
+            </select>
+          </div>
+
           <button
             v-if="queueActive"
             type="button"
@@ -350,14 +454,6 @@ onBeforeUnmount(() => {
                 {{ results.length ? 'Updated live as names are checked' : 'Your checked names will appear here' }}
               </p>
             </div>
-            <button
-              v-if="results.length"
-              type="button"
-              class="shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
-              @click="clearResults"
-            >
-              Clear results
-            </button>
           </div>
 
           <div v-if="runState !== 'idle'" class="mt-3" aria-live="polite">
@@ -382,7 +478,8 @@ onBeforeUnmount(() => {
 
         <template v-if="results.length">
           <div class="shrink-0 border-b border-white/6 px-2 py-2 sm:px-3">
-            <div class="flex max-w-full gap-1 overflow-x-auto" role="tablist">
+            <div class="flex items-center gap-2">
+              <div class="flex min-w-0 flex-1 gap-1 overflow-x-auto" role="tablist">
               <button
                 v-for="filter in filters"
                 :key="filter.value"
@@ -399,6 +496,20 @@ onBeforeUnmount(() => {
                   :class="selectedFilter === filter.value ? 'bg-black/15 text-[#04191b]' : 'bg-white/7 text-slate-500'"
                 >{{ filter.count }}</span>
               </button>
+              </div>
+              <select
+                v-model="resultSort"
+                aria-label="Sort results"
+                class="shrink-0 rounded-md border border-white/10 bg-[#111] px-2 py-1.5 text-[11px] text-slate-300 outline-none focus:border-[#00C8D3]/80"
+              >
+                <option value="newest">Newest</option>
+                <option value="oldest">Oldest</option>
+                <option value="name-asc">Name A–Z</option>
+                <option value="name-desc">Name Z–A</option>
+                <option value="shortest">Shortest</option>
+                <option value="longest">Longest</option>
+                <option value="status">Status</option>
+              </select>
             </div>
           </div>
 
